@@ -55,9 +55,11 @@ def dedup(cands: list[str], X_sample: np.ndarray, names: list[str], max_corr: fl
     return [cands[j] for j in kept]
 
 
-def select(store: Store, train_dates: pd.DatetimeIndex, cfg: Config = CFG) -> pd.DataFrame:
-    t = signal_tstats(store.ic.loc[train_dates], cfg.nw_lags)
-    mean_ic = store.ic.loc[train_dates].mean()
+def select(store: Store, train_dates: pd.DatetimeIndex, cfg: Config = CFG,
+           ic: pd.DataFrame | None = None) -> pd.DataFrame:
+    ic = store.ic if ic is None else ic
+    t = signal_tstats(ic.loc[train_dates], cfg.nw_lags)
+    mean_ic = ic.loc[train_dates].mean()
     cands = t[t.abs() > cfg.tstat_threshold].abs().sort_values(ascending=False).index.tolist()
     sample_days = train_dates[::10]
     sample_rows = np.flatnonzero(np.isin(store.row_date, sample_days.to_numpy()))
@@ -81,8 +83,16 @@ def _train_lgbm(X: np.ndarray, y: np.ndarray, cfg: Config) -> lgb.Booster:
 
 
 def walk_forward(store: Store, cfg: Config = CFG, last_year: int | None = None,
-                 verbose: bool = True) -> tuple[pd.DataFrame, dict]:
-    """Returns (predictions for every test row, per-year selection tables)."""
+                 verbose: bool = True, ic: pd.DataFrame | None = None,
+                 label: np.ndarray | None = None, embargo: int | None = None
+                 ) -> tuple[pd.DataFrame, dict]:
+    """Returns (predictions for every test row, per-year selection tables).
+
+    `ic` and `label` default to the next-day target; pass a longer-horizon IC
+    table and label (with a matching embargo) to train on that horizon.
+    """
+    label = store.rows.y_rank.to_numpy() if label is None else label
+    embargo = cfg.embargo_days if embargo is None else embargo
     years = sorted({d.year for d in store.dates if d.year >= cfg.first_test_year})
     if last_year is not None:
         years = [y for y in years if y <= last_year]
@@ -90,9 +100,9 @@ def walk_forward(store: Store, cfg: Config = CFG, last_year: int | None = None,
     selections = {}
     for year in years:
         t0 = time.time()
-        train_dates, test_dates = split_dates(store.dates, year, cfg.embargo_days)
+        train_dates, test_dates = split_dates(store.dates, year, embargo)
 
-        sel = select(store, train_dates, cfg)
+        sel = select(store, train_dates, cfg, ic)
         selections[year] = sel
         kept = sel.index[sel.kept].tolist()
         kept_idx = [store.names.index(k) for k in kept]
@@ -100,8 +110,9 @@ def walk_forward(store: Store, cfg: Config = CFG, last_year: int | None = None,
 
         train_days = train_dates[::cfg.train_day_stride].to_numpy()
         tr = np.flatnonzero(np.isin(store.row_date, train_days))
+        tr = tr[~np.isnan(label[tr])]
         te = np.flatnonzero(np.isin(store.row_date, test_dates.to_numpy()))
-        y_tr = store.rows.y_rank.to_numpy()[tr]
+        y_tr = label[tr]
         X_te_all = np.asarray(store.X[te], dtype=np.float32)
 
         out = store.rows.iloc[te][["date", "ticker", "target"]].copy()

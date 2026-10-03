@@ -1,0 +1,11 @@
+{
+  "chosen": {
+    "model": "h5_simple",
+    "halflife": 10,
+    "exit_q": 0.2
+  },
+  "name": "h5_simple|hl10|band20",
+  "selected_on": "2016-2019",
+  "criterion": "long-short net Sharpe at 5 bps",
+  "trials": 36
+}

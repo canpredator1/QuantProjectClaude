@@ -28,8 +28,14 @@ from alphafactory.config import CFG  # noqa: E402
 from alphafactory.data import file_sha256  # noqa: E402
 from alphafactory.evaluate import deflated_sharpe, perf_table, sharpe  # noqa: E402
 from alphafactory.factory import run_factory  # noqa: E402
+from alphafactory.horizon import daily_ic_from_features, horizon_labels  # noqa: E402
 
-MODELS = ["simple", "lgbm_selected", "lgbm_all"]
+BASE_MODELS = ["simple", "lgbm_selected", "lgbm_all"]
+HORIZON = 5
+# Round 1: models trained on the next-day return. Round 2 (added after round 1
+# lost money net of costs in validation, before the holdout was ever run):
+# the same models trained on the 5-day return, prefixed "h5_".
+MODELS = BASE_MODELS + [f"h{HORIZON}_{m}" for m in BASE_MODELS]
 HALFLIVES = [0, 3, 10]
 BANDS = [None, 0.2]
 VAL_END = CFG.holdout_start - 1
@@ -47,15 +53,28 @@ def cfg_name(c):
     return f"{c['model']}|hl{c['halflife']}|{band}"
 
 
-def get_predictions(store: Store) -> tuple[pd.DataFrame, dict]:
-    path = CFG.cache_dir / "preds.parquet"
-    sel_path = CFG.cache_dir / "selections.pkl"
+def _cached_walk_forward(store, tag, **kw):
+    path = CFG.cache_dir / f"preds{tag}.parquet"
+    sel_path = CFG.cache_dir / f"selections{tag}.pkl"
     if path.exists() and sel_path.exists():
         return pd.read_parquet(path), pd.read_pickle(sel_path)
-    preds, sels = walk_forward(store, CFG)
+    preds, sels = walk_forward(store, CFG, **kw)
     preds.to_parquet(path)
     pd.to_pickle(sels, sel_path)
     return preds, sels
+
+
+def get_predictions(store: Store, panels) -> tuple[pd.DataFrame, dict]:
+    preds, sels = _cached_walk_forward(store, "")
+    lab = horizon_labels(store, panels, HORIZON, CFG)
+    y = lab.y_rank_h.to_numpy()
+    ic_h = daily_ic_from_features(store, y, CFG, name=f"h{HORIZON}")
+    preds_h, sels_h = _cached_walk_forward(store, f"_h{HORIZON}", ic=ic_h, label=y,
+                                           embargo=max(CFG.embargo_days, HORIZON + 2))
+    assert (preds_h.date.to_numpy() == preds.date.to_numpy()).all()
+    for m in BASE_MODELS:
+        preds[f"h{HORIZON}_{m}"] = preds_h[m].to_numpy()
+    return preds, {"d1": sels, f"h{HORIZON}": sels_h}
 
 
 def evaluate_all(preds: pd.DataFrame, target: pd.DataFrame):
@@ -114,8 +133,7 @@ def stage_final(store, preds, sels, results, panels_target):
     hs, ve = CFG.holdout_start, VAL_END
 
     # ---------------- signal-level evidence ----------------
-    first = sels[CFG.first_test_year]
-    disc_end = first.index  # noqa: F841 (documentation: selection table for the first window)
+    first = sels["d1"][CFG.first_test_year]
     meta = store.meta.set_index("signal")
     disc_dates = store.dates[store.dates < pd.Timestamp(f"{CFG.first_test_year}-01-01")]
     t_placebo = signal_tstats(store.ic_placebo.loc[disc_dates], CFG.nw_lags)
@@ -155,9 +173,10 @@ def stage_final(store, preds, sels, results, panels_target):
     fam = allsig.assign(passed=allsig.t_2006_2015.abs() > CFG.tstat_threshold).groupby("family") \
         .agg(tested=("passed", "size"), passed=("passed", "sum"))
 
+    variant = f"h{HORIZON}" if chosen["chosen"]["model"].startswith("h") else "d1"
     sel_rows = [{"year": y, "passed": int(s.passed.sum()), "kept": int(s.kept.sum()),
                  "top_kept": ", ".join(s[s.kept].t.abs().sort_values(ascending=False).index[:5])}
-                for y, s in sels.items()]
+                for y, s in sels[variant].items()]
 
     # ---------------- strategy-level evidence ----------------
     res = results[best]
@@ -290,6 +309,22 @@ def write_results(R, chosen, best, n_sig, n_pass, n_pass_placebo, n_pass_2, n_pa
     a(f"- **Chosen configuration (frozen before the holdout was run):** `{best}` — picked from "
       f"{chosen['trials']} configurations by {chosen['criterion']}.\n")
 
+    r1 = pd.read_csv(R / "validation_round1.csv")
+    r2 = pd.read_csv(R / "validation_scores.csv")
+    a("## Research log (in the order it happened)\n")
+    a(f"1. **Round 1** — {len(r1)} configurations, models trained on the next-day return. "
+      f"Validation {CFG.first_test_year}–{hs - 1}: **all {int((r1.ls_net_sharpe <= 0).sum())} of "
+      f"{len(r1)} lost money after costs** (best net Sharpe {r1.ls_net_sharpe.max():.2f}). The "
+      f"edge was real before costs (best gross Sharpe {r1.ls_gross_sharpe.max():.2f}) but needed "
+      f"~{r1.loc[r1.ls_gross_sharpe.idxmax(), 'turnover']:.1f}x turnover a day. "
+      "(`reports/validation_round1.csv`)")
+    a(f"2. **Round 2** — added {len(r2) - len(r1)} configurations trained on the 5-day return so "
+      "positions can be held longer. Decided on validation data only; the holdout had not been "
+      f"run. Best validation net Sharpe across all {len(r2)}: {r2.ls_net_sharpe.max():.2f} → frozen. "
+      "(`reports/validation_scores.csv`)")
+    a("3. **Final** — the holdout was run once, with the frozen choice. All "
+      f"{len(r2)} configurations count as trials in the deflated Sharpe ratio.\n")
+
     a("## 1. Signal discovery (2006–2015)\n")
     a(f"Hurdle: Newey-West |t| > {CFG.tstat_threshold:g} on the daily rank-IC.\n")
     a("| | Real target | Shuffled target (pure luck) |")
@@ -384,9 +419,10 @@ def main():
     if not (CFG.cache_dir / "features.npy").exists():
         run_factory(CFG)
     store = Store(CFG)
-    preds, sels = get_predictions(store)
     from alphafactory.data import build_panels
-    target = build_panels(CFG).target
+    panels = build_panels(CFG)
+    target = panels.target
+    preds, sels = get_predictions(store, panels)
     if args.stage == "validation":
         preds_val = preds[preds.date.dt.year <= VAL_END]
         stage_validation(evaluate_all(preds_val, target))
