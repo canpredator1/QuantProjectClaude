@@ -6,6 +6,10 @@ with trading costs on the point-in-time S&P 500.
 
 **Results: [`reports/RESULTS.md`](reports/RESULTS.md)**
 
+> Also in this repo: a prediction-market forecaster (Claude forecasts Polymarket
+> questions blind, paper-trades, and is scored against the market). See
+> [`docs/POLYMARKET.md`](docs/POLYMARKET.md).
+
 ## What we found (October 2026 run)
 
 1. **The signals are real.** 46 of 227 ideas cleared a strict t > 3 bar on
