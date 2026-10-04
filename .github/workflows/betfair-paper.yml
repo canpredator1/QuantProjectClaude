@@ -1,0 +1,37 @@
+# Daily Betfair paper-trading run: settle, forecast, score, commit the ledger.
+# Needs secrets BETFAIR_USERNAME, BETFAIR_PASSWORD, BETFAIR_APP_KEY (delayed key), ANTHROPIC_API_KEY.
+# Read-only market data; never places bets.
+name: betfair-paper
+
+on:
+  schedule:
+    - cron: "23 8 * * *"      # 08:23 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    env:
+      BETFAIR_USERNAME: ${{ secrets.BETFAIR_USERNAME }}
+      BETFAIR_PASSWORD: ${{ secrets.BETFAIR_PASSWORD }}
+      BETFAIR_APP_KEY: ${{ secrets.BETFAIR_APP_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python scripts/bf.py settle
+      - run: python scripts/bf.py forecast
+      - run: python scripts/bf.py score
+      - name: Commit ledger
+        run: |
+          git config user.name "paper-bot"
+          git config user.email "paper-bot@users.noreply.github.com"
+          git add paper/betfair_ledger.jsonl
+          git diff --cached --quiet || git commit -m "Betfair paper ledger update $(date -u +%F)"
+          git push
